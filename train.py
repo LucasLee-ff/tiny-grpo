@@ -12,9 +12,16 @@ from torch.nn.utils import clip_grad_norm_
 from torch.utils.data import DataLoader
 from transformers import (
     AutoTokenizer,
+    AutoModelForCausalLM,
+    BitsAndBytesConfig,
     PreTrainedTokenizer,
-    LlamaForCausalLM,
     GenerationConfig,
+)
+from peft import (
+    LoraConfig,
+    get_peft_model,
+    PeftModel,
+    prepare_model_for_kbit_training,
 )
 from loss import approx_kl_divergence, GRPOLoss
 from replay_buffer import ReplayBuffer, Experience, join_experience_batch
@@ -25,16 +32,46 @@ def load_model(
     trust_remote_code: bool = False,
     bf16: bool = True,
     device_map=None,
-) -> tuple[LlamaForCausalLM, PreTrainedTokenizer]:
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path)
+) -> tuple[PeftModel, PreTrainedTokenizer]:
+    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, local_files_only=True)
     tokenizer.pad_token = tokenizer.eos_token
-    model = LlamaForCausalLM.from_pretrained(
+
+    compute_dtype = torch.bfloat16 if bf16 else torch.float16
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=compute_dtype,
+        bnb_4bit_use_double_quant=True,
+    )
+
+    model = AutoModelForCausalLM.from_pretrained(
         model_name_or_path,
         trust_remote_code=trust_remote_code,
-        attn_implementation="flash_attention_2",
+        attn_implementation="sdpa",
         torch_dtype=torch.bfloat16 if bf16 else "auto",
         device_map=device_map,
+        quantization_config=bnb_config,
+        local_files_only=True,
     )
+
+    model.gradient_checkpointing_enable(
+        gradient_checkpointing_kwargs={"use_reentrant": False}
+    )
+    model = prepare_model_for_kbit_training(model)
+
+    lora_config = LoraConfig(
+        r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+        bias="none",
+        task_type="CAUSAL_LM",
+        target_modules=[
+            "q_proj", "k_proj", "v_proj", "o_proj",
+            "gate_proj", "up_proj", "down_proj",
+        ],
+    )
+    model = get_peft_model(model, lora_config)
+
     return model, tokenizer
 
 
@@ -47,7 +84,7 @@ The assistant first thinks about the reasoning process in the mind and then prov
 
 @torch.no_grad()
 def rollout(
-    model: LlamaForCausalLM,
+    model: PeftModel,
     tokenizer: PreTrainedTokenizer,
     task: str,
     oracle_answer: str,
@@ -55,82 +92,88 @@ def rollout(
     max_length: int = 1024,
     temperature: float = 1.0,
     top_p: float = 1.0,
-) -> tuple[torch.Tensor, torch.Tensor, list[str]]:
+) -> Optional[tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[str]]]:
 
     model.eval()
 
-    # 1. format prompt
-    chat_messages = [
-        {
-            "role": "system",
-            "content": system_prompt,
-        },
-        {
-            "role": "user",
-            "content": task,
-        },
-    ]
-    chat_prompt = tokenizer.apply_chat_template(
-        chat_messages, tokenize=False, add_generation_prompt=True
-    )
-    model_inputs = tokenizer(
-        [chat_prompt],
-        return_tensors="pt",
-        padding=True,
-        padding_side="left",
-        return_attention_mask=True,
-    ).to("cuda")
-
-    # duplicate prompt num_rollouts times
-    model_inputs["attention_mask"] = model_inputs["attention_mask"].repeat(
-        num_rollouts, 1
-    )
-
-    input_ids = model_inputs["input_ids"].repeat(num_rollouts, 1)
-    model_inputs["input_ids"] = input_ids
-
-    # 2. sample completions
-    pad_token_id = tokenizer.eos_token_id
-    generation_config = GenerationConfig(
-        do_sample=True,
-        top_p=top_p,
-        temperature=temperature,
-        max_length=max_length,
-        pad_token_id=pad_token_id,
-    )
-    sequence_ids = model.generate(**model_inputs, generation_config=generation_config)
-    completions = tokenizer.batch_decode(
-        sequence_ids[:, input_ids.shape[1] :], skip_special_tokens=True
-    )
-
-    action_mask = torch.zeros_like(sequence_ids, dtype=torch.bool)
-    action_mask[:, input_ids.shape[1] :] = True
-    action_mask[sequence_ids == pad_token_id] = False
-    action_mask = action_mask[:, 1:]
-
-    # 3. determine rewards
-    returns = torch.zeros(num_rollouts, 1, dtype=torch.float)
-    for i, completion in enumerate(completions):
-        # search answer tag
-        answer_match = re.search(
-            r"<answer>(.*?)</answer>",
-            completion,
-            flags=re.DOTALL,
+    input_len = 0
+    try:
+        # 1. format prompt
+        chat_messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": task},
+        ]
+        chat_prompt = tokenizer.apply_chat_template(
+            chat_messages, tokenize=False, add_generation_prompt=True
         )
+        model_inputs = tokenizer(
+            [chat_prompt],
+            return_tensors="pt",
+            padding=True,
+            padding_side="left",
+            return_attention_mask=True,
+        ).to("cuda")
 
-        answer = answer_match.group(1) if answer_match else None
-        reward = 0
-        if answer is not None:
-            if answer == oracle_answer:
-                reward = 1.0
-            elif oracle_answer in answer:
-                reward = 0.5
-            else:
-                reward = 0.01
+        input_len = model_inputs["input_ids"].shape[1]
 
-        returns[i] = reward
+        # duplicate prompt num_rollouts times
+        model_inputs["attention_mask"] = model_inputs["attention_mask"].repeat(
+            num_rollouts, 1
+        )
+        input_ids = model_inputs["input_ids"].repeat(num_rollouts, 1)
+        model_inputs["input_ids"] = input_ids
 
-    return sequence_ids, returns.to(sequence_ids.device), action_mask, completions
+        # 2. sample completions
+        pad_token_id = tokenizer.eos_token_id
+        generation_config = GenerationConfig(
+            do_sample=True,
+            top_p=top_p,
+            temperature=temperature,
+            max_new_tokens=max_length,
+            pad_token_id=pad_token_id,
+        )
+        sequence_ids = model.generate(**model_inputs, generation_config=generation_config)
+        completions = tokenizer.batch_decode(
+            sequence_ids[:, input_len:], skip_special_tokens=True
+        )
+        print(f">>> sample completion: \n{completions[0][:200]}")
+
+        action_mask = torch.zeros_like(sequence_ids, dtype=torch.bool)
+        action_mask[:, input_len:] = True
+        action_mask[sequence_ids == pad_token_id] = False
+        action_mask = action_mask[:, 1:]
+
+        # 3. determine rewards
+        returns = torch.zeros(num_rollouts, 1, dtype=torch.float)
+        for i, completion in enumerate(completions):
+            answer_match = re.search(
+                r"<answer>(.*?)</answer>",
+                completion,
+                flags=re.DOTALL,
+            )
+
+            answer = answer_match.group(1) if answer_match else None
+            reward = 0
+            if answer is not None:
+                if answer == oracle_answer:
+                    reward = 1.0
+                elif oracle_answer in answer:
+                    reward = 0.5
+                else:
+                    reward = 0.01
+
+            returns[i] = reward
+
+        return sequence_ids, returns.to(sequence_ids.device), action_mask, completions
+
+    except Exception as e:
+        print(f"[rollout ERROR] task: {task!r}")
+        print(f"[rollout ERROR] oracle_answer: {oracle_answer!r}")
+        print(f"[rollout ERROR] input_len: {input_len}")
+        print(f"[rollout ERROR] num_rollouts: {num_rollouts}")
+        print(f"[rollout ERROR] exception: {type(e).__name__}: {e}")
+        print(f"[rollout ERROR] 跳过该样本，继续下一个...")
+        return None
 
 
 def init_rng(seed: int) -> torch.Generator:
@@ -143,14 +186,14 @@ def group_advantages(returns: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
 
 
 def sequence_log_probs_from_logits(
-    logits: torch.tensor, output_ids: torch.tensor
+    logits: torch.Tensor, output_ids: torch.Tensor
 ) -> torch.Tensor:
     log_prob = F.log_softmax(logits, dim=-1)
     return log_prob.gather(dim=-1, index=output_ids.unsqueeze(-1)).squeeze(-1)
 
 
 def sequences_log_probs(
-    model: LlamaForCausalLM,
+    model: PeftModel,
     sequence_ids: torch.Tensor,
     attention_mask: torch.Tensor,
 ) -> torch.Tensor:
@@ -195,21 +238,21 @@ def main():
     seed = 42
     wandb_project = None  # "tiny_grpo"
     device_index = 0
-    model_name = "meta-llama/Llama-3.2-1B-Instruct"
+    model_name = "Qwen/Qwen2.5-0.5B-Instruct"
     checkpoint_path = Path("./output")
     checkpoint_interval = 20
-    train_batch_size = 16
+    train_batch_size = 4
     lr = 5e-6
     kl_weight = 0.01
     clip_eps = 0.2
 
-    group_size = 12
+    group_size = 4
     rollouts_per_step = 32
     epochs_per_step = 1
     max_norm = 1.0  # gradient clipping
 
     # rollout params
-    max_length = 1024
+    max_length = 128
     top_p = 1.0
     temperature = 1.0
 
@@ -217,14 +260,8 @@ def main():
     cpu_device = torch.device("cpu")
     init_rng(seed)
 
-    reference_model, _ = load_model(model_name, device_map=device)
     model, tokenizer = load_model(model_name, device_map=device)
     optimizer = optim.Adam(model.parameters(), lr=lr)
-
-    reference_model.eval()
-    model.gradient_checkpointing_enable(
-        gradient_checkpointing_kwargs={"use_reentrant": False}
-    )
 
     pad_token_id = tokenizer.eos_token_id
 
@@ -262,7 +299,7 @@ def main():
 
         with torch.no_grad():
             for q, a in zip(questions, answers):
-                sequence_ids, returns, action_mask, completions = rollout(
+                result = rollout(
                     model,
                     tokenizer,
                     q,
@@ -272,10 +309,10 @@ def main():
                     temperature=temperature,
                     top_p=top_p,
                 )
+                if result is None:
+                    continue
+                sequence_ids, returns, action_mask, completions = result
 
-                print(
-                    f"rollout q='{q}', a='{a}', returns={returns.sum().item():.2f}, replay_buffer_size={len(replay_buffer)}, sequence_ids={sequence_ids.shape}"
-                )
                 rollout_returns.append(returns.cpu())
 
                 advantages = group_advantages(returns)
@@ -286,11 +323,12 @@ def main():
                     sequence_ids=sequence_ids,
                     attention_mask=attention_mask,
                 )
-                log_probs_ref = sequences_log_probs(
-                    model=reference_model,
-                    sequence_ids=sequence_ids,
-                    attention_mask=attention_mask,
-                )
+                with model.disable_adapter():
+                    log_probs_ref = sequences_log_probs(
+                        model=model,
+                        sequence_ids=sequence_ids,
+                        attention_mask=attention_mask,
+                    )
                 kl = approx_kl_divergence(
                     log_probs=log_probs,
                     log_probs_ref=log_probs_ref,
@@ -308,6 +346,10 @@ def main():
                     kl=kl,
                 )
                 replay_buffer.append(experience.to(cpu_device))
+                print(
+                    f">>> rollout\n q='{q}', a='{a}', returns={returns.sum().item():.2f}, replay_buffer_size={len(replay_buffer)}, sequence_ids={sequence_ids.shape}"
+                )
+                print("-" * 80)
 
         torch.cuda.empty_cache()
         episode_return_sum = torch.stack(rollout_returns).sum()

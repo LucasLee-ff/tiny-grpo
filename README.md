@@ -1,6 +1,6 @@
 # Minimal GRPO implementation
 
-Goal: Working toy implementation of llama-3.2-3b locally RL training with GRPO. Understanding the algorithm & hyper parameters. Just running everything locally on a single node.
+Goal: Working toy implementation of Qwen2.5-0.5B-Instruct with 4-bit QLoRA, RL training with GRPO on a single 8GB GPU. Understanding the algorithm & hyperparameters.
 
 ### Setup
 
@@ -15,7 +15,6 @@ conda activate grpo
 
 ```
 pip install -r requirements.txt
-pip install flash-attn --no-build-isolation
 ```
 
 3. Play with the source in `train.py`
