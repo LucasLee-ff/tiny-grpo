@@ -1,4 +1,8 @@
 """Qwen2.5-0.5B-Instruct 推理测试脚本"""
+import sys
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, GenerationConfig
 

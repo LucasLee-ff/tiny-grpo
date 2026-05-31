@@ -1,4 +1,8 @@
 """验证测试集中每道题的答案是否正确，打印错误项。"""
+import sys
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+
 import json
 import re
 from pathlib import Path

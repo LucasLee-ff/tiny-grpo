@@ -1,3 +1,7 @@
+import sys
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
+
 """读取 metrics.csv 并生成趋势图。
 
 用法:
