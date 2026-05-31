@@ -19,7 +19,10 @@ from transformers import (
     GenerationConfig,
 )
 from peft import PeftModel
+import sys
 
+sys.stdout.reconfigure(encoding="utf-8")
+sys.stderr.reconfigure(encoding="utf-8")
 
 def load_model(
     model_name: str = "Qwen/Qwen2.5-0.5B-Instruct",
@@ -72,6 +75,22 @@ def extract_answer(completion: str) -> Optional[str]:
     return match.group(1).strip()
 
 
+def check_tags(completion: str) -> dict:
+    """检查 completion 中是否包含 <think> / <answer> 标签对。"""
+    has_think_open = "<think>" in completion
+    has_think_close = "</think>" in completion
+    has_answer_open = "<answer>" in completion
+    has_answer_close = "</answer>" in completion
+    return {
+        "think_open": has_think_open,
+        "think_close": has_think_close,
+        "answer_open": has_answer_open,
+        "answer_close": has_answer_close,
+        "has_think_pair": has_think_open and has_think_close,
+        "has_answer_pair": has_answer_open and has_answer_close,
+    }
+
+
 def evaluate_one(
     model, tokenizer, question: str, oracle_answer: str, num_samples: int
 ) -> dict:
@@ -112,10 +131,17 @@ def evaluate_one(
     partial_matches = 0
     no_answer = 0
     extracted_answers = []
+    tag_stats = {"think_open": 0, "think_close": 0, "answer_open": 0, "answer_close": 0,
+                 "has_think_pair": 0, "has_answer_pair": 0}
 
     for completion in completions:
         extracted = extract_answer(completion)
         extracted_answers.append(extracted)
+
+        tags = check_tags(completion)
+        for key in tag_stats:
+            tag_stats[key] += tags[key]
+
         if extracted is None:
             no_answer += 1
         elif extracted == oracle_answer:
@@ -133,6 +159,7 @@ def evaluate_one(
         "no_answer": no_answer,
         "extracted_answers": extracted_answers,
         "completions": completions,
+        "tag_stats": tag_stats,
     }
 
 
@@ -172,6 +199,8 @@ def main():
     total_partial = 0
     total_no_answer = 0
     total_samples = 0
+    total_tags = {"think_open": 0, "think_close": 0, "answer_open": 0, "answer_close": 0,
+                  "has_think_pair": 0, "has_answer_pair": 0}
 
     for prob in test_problems:
         result = evaluate_one(
@@ -181,18 +210,19 @@ def main():
         total_partial += result["partial_match"]
         total_no_answer += result["no_answer"]
         total_samples += args.num_samples
+        for key in total_tags:
+            total_tags[key] += result["tag_stats"][key]
 
         if args.verbose:
             print(f"[{prob['id']}] {prob['question']}  (答案={prob['answer']})")
             print(f"  精确匹配: {result['exact_match']}/{args.num_samples}")
-            print(
-                f"  包含答案: {result['partial_match']}/{args.num_samples}"
-            )
+            print(f"  包含答案: {result['partial_match']}/{args.num_samples}")
             print(f"  无答案:   {result['no_answer']}/{args.num_samples}")
-            for i, (ans, comp) in enumerate(
-                zip(result["extracted_answers"], result["completions"])
-            ):
-                print(f"  sample {i}: 提取='{ans}'  |  {comp[:80]}...")
+            if args.verbose:
+                for i, (ans, comp) in enumerate(
+                    zip(result["extracted_answers"], result["completions"])
+                ):
+                    print(f"  sample {i}: 提取='{ans}'  |  {comp[:80]}...")
             print()
 
     # 汇总
@@ -204,7 +234,15 @@ def main():
     print(f"汇总结果 ({len(test_problems)} 题, 每题 {args.num_samples} 次采样)")
     print(f"  精确匹配率 (exact@1):    {total_exact}/{total_samples} = {exact_rate:.1f}%")
     print(f"  包含答案率 (pass@1):     {total_partial}/{total_samples} = {partial_rate:.1f}%")
-    print(f"  未生成答案标签率:        {total_no_answer}/{total_samples} = {no_answer_rate:.1f}%")
+    print(f"  未生成 <answer> 标签:     {total_no_answer}/{total_samples} = {no_answer_rate:.1f}%")
+    print()
+    print(f"标签格式统计 (共 {total_samples} 次采样):")
+    print(f"  <think> 标签:   {total_tags['think_open']} = {total_tags['think_open']/total_samples*100:.1f}%")
+    print(f"  </think> 标签:  {total_tags['think_close']} = {total_tags['think_close']/total_samples*100:.1f}%")
+    print(f"  <think>...</think> 成对: {total_tags['has_think_pair']} = {total_tags['has_think_pair']/total_samples*100:.1f}%")
+    print(f"  <answer> 标签:  {total_tags['answer_open']} = {total_tags['answer_open']/total_samples*100:.1f}%")
+    print(f"  </answer> 标签: {total_tags['answer_close']} = {total_tags['answer_close']/total_samples*100:.1f}%")
+    print(f"  <answer>...</answer> 成对: {total_tags['has_answer_pair']} = {total_tags['has_answer_pair']/total_samples*100:.1f}%")
 
 
 if __name__ == "__main__":
