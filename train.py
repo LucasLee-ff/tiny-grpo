@@ -1,4 +1,5 @@
 from collections.abc import Callable
+import csv
 import json
 from pathlib import Path
 import random
@@ -289,6 +290,11 @@ def main():
     else:
         wandb.init(project=wandb_project)
 
+    metrics_path = Path("metrics.csv")
+    metrics_file = metrics_path.open("w", newline="")
+    metrics_writer = csv.writer(metrics_file)
+    metrics_writer.writerow(["step", "returns", "loss", "kl", "grad_norm"])
+
     for k, prompt_batch in enumerate(prompt_loader):
         rollout_returns = []
 
@@ -364,6 +370,10 @@ def main():
             collate_fn=join_experience_batch,
         )
 
+        train_losses = []
+        train_kls = []
+        train_grad_norms = []
+
         for step_epoch in range(epochs_per_step):
             model.train()
 
@@ -392,6 +402,17 @@ def main():
 
                 optimizer.step()
 
+                train_losses.append(loss.item())
+                train_kls.append(kl.mean().item())
+                train_grad_norms.append(grad_norm.item())
+
+        step_loss = sum(train_losses) / len(train_losses) if train_losses else 0
+        step_kl = sum(train_kls) / len(train_kls) if train_kls else 0
+        step_grad_norm = sum(train_grad_norms) / len(train_grad_norms) if train_grad_norms else 0
+
+        metrics_writer.writerow([k, episode_return_sum.item(), step_loss, step_kl, step_grad_norm])
+        metrics_file.flush()
+
         if (
             checkpoint_path is not None
             and checkpoint_interval is not None
@@ -401,6 +422,9 @@ def main():
 
     if checkpoint_path is not None:
         model.save_pretrained(checkpoint_path / f"step_{k}")
+
+    metrics_file.close()
+    print(f"metrics saved to {metrics_path}")
 
 
 if __name__ == "__main__":
